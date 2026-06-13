@@ -1,0 +1,266 @@
+#!/bin/bash
+# =====================================================================
+# kineld - Build tool for Kinet OS
+# Supports clean, build, -iso, -img formats, and --x86 / --x86_64 arches
+# Generates unified hybrid BIOS/UEFI boot images
+# =====================================================================
+set -e
+
+# Default settings
+ARCH="x86_64"
+FORMAT="bin" # bin, iso, img
+CLEAN=0
+BUILD=0
+VERSION="1.0.0"
+
+# Check for sync tools command
+if [ "$1" = "sync" ] && [ "$2" = "tools" ]; then
+    echo "=== Syncing/Installing Build Tools ==="
+    if [ -x "$(command -v apt-get)" ]; then
+        echo "Detected Debian/Ubuntu-based system. Using apt-get..."
+        sudo apt-get update
+        sudo apt-get install -y nasm gcc g++ binutils genisoimage mtools
+    elif [ -x "$(command -v dnf)" ]; then
+        echo "Detected Fedora/RHEL-based system. Using dnf..."
+        sudo dnf install -y nasm gcc gcc-c++ binutils genisoimage mtools
+    elif [ -x "$(command -v pacman)" ]; then
+        echo "Detected Arch Linux. Using pacman..."
+        sudo pacman -Syu --noconfirm nasm gcc binutils cdrtools mtools
+    else
+        echo "Error: Could not identify package manager."
+        echo "Please install the following tools manually:"
+        echo "  - nasm"
+        echo "  - gcc / g++"
+        echo "  - binutils (ld)"
+        echo "  - genisoimage"
+        echo "  - mtools"
+        exit 1
+    fi
+    echo "=== Tools installation complete! ==="
+    exit 0
+fi
+
+# Parse arguments
+for arg in "$@"; do
+    case $arg in
+        clean)
+            CLEAN=1
+            ;;
+        build)
+            BUILD=1
+            ;;
+        -iso)
+            FORMAT="iso"
+            ;;
+        -img)
+            FORMAT="img"
+            ;;
+        --x86)
+            ARCH="x86"
+            ;;
+        --x86_64)
+            ARCH="x86_64"
+            ;;
+        *)
+            echo "Unknown argument: $arg"
+            echo "Usage:"
+            echo "  kineld [clean] [build] [-iso | -img] [--x86 | --x86_64]"
+            echo "  kineld sync tools"
+            exit 1
+            ;;
+    esac
+done
+
+if [ $CLEAN -eq 1 ]; then
+    echo "=== Cleaning Build Directory ==="
+    mkdir -p build
+    rm -rf build/*
+fi
+
+if [ $BUILD -eq 0 ]; then
+    echo "No build action specified. Exiting."
+    exit 0
+fi
+
+echo "=== Building Kinet OS ==="
+echo "Target Architecture: $ARCH"
+echo "Target Format      : $FORMAT"
+
+# Define output filenames according to the kinet-version-architecture scheme
+mkdir -p build/binary
+BIOS_BIN="build/binary/kinet-${VERSION}-${ARCH}-bios.bin"
+UEFI_EFI="build/binary/kinet-${VERSION}-${ARCH}-uefi.efi"
+BIOS_IMG="build/binary/kinet-${VERSION}-${ARCH}-bios.img"
+UEFI_IMG="build/binary/kinet-${VERSION}-${ARCH}-uefi.img"
+ISO_OUT="build/binary/kinet-${VERSION}-${ARCH}.iso"
+
+# Create build directory if it doesn't exist
+mkdir -p build
+
+if [ "$ARCH" = "x86_64" ]; then
+    # =================================================================
+    # x86_64 Target Build
+    # =================================================================
+    
+    # 1. BIOS Build
+    echo "--- Assembling x86_64 BIOS Bootloader ---"
+    mkdir -p build/bios/arch/boot/x86_64
+    nasm -f bin -d BIOS arch/boot/x86_64/boot.asm -o build/bios/arch/boot/x86_64/boot.bin
+
+    echo "--- Compiling x86_64 BIOS Kernel, Drivers & Userland ---"
+    mkdir -p build/bios/kernel
+    mkdir -p build/bios/driver
+    mkdir -p build/bios/userland
+    
+    gcc -m64 -c -ffreestanding -fno-pic -fno-pie -nostdlib -I driver/include kernel/kernel.c -o build/bios/kernel/kernel.o
+    gcc -m64 -c -ffreestanding -fno-pic -fno-pie -nostdlib -I driver/include driver/console.c -o build/bios/driver/console.o
+    g++ -m64 -c -ffreestanding -fno-pic -fno-pie -fno-rtti -fno-exceptions -nostdlib -I driver/include userland/shell.cpp -o build/bios/userland/shell.o
+
+    echo "--- Linking x86_64 BIOS Kernel ---"
+    # Link kernel.o first to ensure it occupies the entry address (0x9000)
+    ld -m elf_x86_64 -Ttext 0x9000 -e kernel_main \
+        build/bios/kernel/kernel.o build/bios/driver/console.o build/bios/userland/shell.o \
+        -o build/bios/kernel.bin --oformat binary
+
+    echo "--- Creating x86_64 Raw BIOS OS Image ---"
+    cat build/bios/arch/boot/x86_64/boot.bin build/bios/kernel.bin > "$BIOS_BIN"
+
+    # 2. UEFI Build
+    echo "--- Assembling x86_64 UEFI Bootloader ---"
+    mkdir -p build/uefi/arch/boot/x86_64
+    nasm -f win64 -d UEFI arch/boot/x86_64/boot.asm -o build/uefi/arch/boot/x86_64/boot.o
+
+    echo "--- Compiling x86_64 UEFI Kernel, Drivers & Userland ---"
+    mkdir -p build/uefi/kernel
+    mkdir -p build/uefi/driver
+    mkdir -p build/uefi/userland
+    
+    gcc -m64 -c -ffreestanding -fshort-wchar -mno-red-zone -DUEFI_MODE -fpic -fpie -I driver/include kernel/kernel.c -o build/uefi/kernel/kernel.o
+    gcc -m64 -c -ffreestanding -fshort-wchar -mno-red-zone -DUEFI_MODE -fpic -fpie -I driver/include driver/console.c -o build/uefi/driver/console.o
+    g++ -m64 -c -ffreestanding -fshort-wchar -mno-red-zone -DUEFI_MODE -fpic -fpie -fno-rtti -fno-exceptions -I driver/include userland/shell.cpp -o build/uefi/userland/shell.o
+
+    echo "--- Linking x86_64 UEFI Application ---"
+    ld -m i386pep --subsystem 10 -e efi_main -S \
+        build/uefi/arch/boot/x86_64/boot.o build/uefi/kernel/kernel.o build/uefi/driver/console.o build/uefi/userland/shell.o \
+        -o "$UEFI_EFI"
+
+elif [ "$ARCH" = "x86" ]; then
+    # =================================================================
+    # x86 (32-bit) Target Build
+    # =================================================================
+    
+    # 1. BIOS Build
+    echo "--- Assembling x86 BIOS Bootloader ---"
+    mkdir -p build/bios/arch/boot/x86
+    nasm -f bin -d BIOS arch/boot/x86/boot.asm -o build/bios/arch/boot/x86/boot.bin
+
+    echo "--- Compiling x86 BIOS Kernel, Drivers & Userland ---"
+    mkdir -p build/bios/kernel
+    mkdir -p build/bios/driver
+    mkdir -p build/bios/userland
+    
+    gcc -m32 -c -ffreestanding -fno-pic -fno-pie -nostdlib -I driver/include kernel/kernel.c -o build/bios/kernel/kernel.o
+    gcc -m32 -c -ffreestanding -fno-pic -fno-pie -nostdlib -I driver/include driver/console.c -o build/bios/driver/console.o
+    g++ -m32 -c -ffreestanding -fno-pic -fno-pie -fno-rtti -fno-exceptions -nostdlib -I driver/include userland/shell.cpp -o build/bios/userland/shell.o
+
+    echo "--- Linking x86 BIOS Kernel ---"
+    # Link kernel.o first to ensure it occupies the entry address (0x9000)
+    ld -m elf_i386 -Ttext 0x9000 -e kernel_main \
+        build/bios/kernel/kernel.o build/bios/driver/console.o build/bios/userland/shell.o \
+        -o build/bios/kernel.bin --oformat binary
+
+    echo "--- Creating x86 Raw BIOS OS Image ---"
+    cat build/bios/arch/boot/x86/boot.bin build/bios/kernel.bin > "$BIOS_BIN"
+
+    # 2. UEFI Build
+    echo "--- Assembling x86 UEFI Bootloader ---"
+    mkdir -p build/uefi/arch/boot/x86
+    nasm -f win32 -d UEFI arch/boot/x86/boot.asm -o build/uefi/arch/boot/x86/boot.o
+
+    echo "--- Compiling x86 UEFI Kernel, Drivers & Userland ---"
+    mkdir -p build/uefi/kernel
+    mkdir -p build/uefi/driver
+    mkdir -p build/uefi/userland
+    
+    gcc -m32 -c -ffreestanding -fshort-wchar -DUEFI_MODE -fno-pic -fno-pie -I driver/include kernel/kernel.c -o build/uefi/kernel/kernel.o
+    gcc -m32 -c -ffreestanding -fshort-wchar -DUEFI_MODE -fno-pic -fno-pie -I driver/include driver/console.c -o build/uefi/driver/console.o
+    g++ -m32 -c -ffreestanding -fshort-wchar -DUEFI_MODE -fno-pic -fno-pie -fno-rtti -fno-exceptions -I driver/include userland/shell.cpp -o build/uefi/userland/shell.o
+
+    echo "--- Linking x86 UEFI Application ---"
+    ld -m i386pe --subsystem 10 -e efi_main -S \
+        build/uefi/arch/boot/x86/boot.o build/uefi/kernel/kernel.o build/uefi/driver/console.o build/uefi/userland/shell.o \
+        -o "$UEFI_EFI"
+fi
+
+# =====================================================================
+# Helper function to create the hybrid BIOS/UEFI floppy disk image
+# =====================================================================
+create_hybrid_img() {
+    local target_file="$1"
+    echo "Creating hybrid BIOS/UEFI image: $target_file"
+    
+    # 1. Create a zeroed 1.44MB floppy image file
+    dd if=/dev/zero of="$target_file" bs=1k count=1440 2>/dev/null
+    
+    # 2. Format it as FAT12
+    mformat -i "$target_file" -f 1440 ::
+    
+    # 3. Write BIOS boot sector into sector 0 (preserves FAT12 BPB and writes code)
+    if [ "$ARCH" = "x86_64" ]; then
+        dd if=build/bios/arch/boot/x86_64/boot.bin of="$target_file" conv=notrunc 2>/dev/null
+    else
+        dd if=build/bios/arch/boot/x86/boot.bin of="$target_file" conv=notrunc 2>/dev/null
+    fi
+    
+    # 4. Copy the BIOS kernel to cluster 2 (LBA 33) first
+    mcopy -i "$target_file" build/bios/kernel.bin ::/kernel.bin
+    
+    # 5. Copy the UEFI application
+    mmd -i "$target_file" ::/efi
+    mmd -i "$target_file" ::/efi/boot
+    if [ "$ARCH" = "x86_64" ]; then
+        mcopy -i "$target_file" "$UEFI_EFI" ::/efi/boot/bootx64.efi
+    else
+        mcopy -i "$target_file" "$UEFI_EFI" ::/efi/boot/bootia32.efi
+    fi
+}
+
+# =====================================================================
+# Packaging according to requested format
+# =====================================================================
+if [ "$FORMAT" = "bin" ]; then
+    # Default format: Output a hybrid BIOS/UEFI boot image named kinet-version-arch.bin
+    OUTPUT_BIN="build/binary/kinet-${VERSION}-${ARCH}.bin"
+    create_hybrid_img "$OUTPUT_BIN"
+    echo "SUCCESS: Hybrid BIOS/UEFI binary $OUTPUT_BIN created!"
+
+elif [ "$FORMAT" = "img" ]; then
+    # IMG format: Output a hybrid BIOS/UEFI boot image named kinet-version-arch.img
+    OUTPUT_IMG="build/binary/kinet-${VERSION}-${ARCH}.img"
+    create_hybrid_img "$OUTPUT_IMG"
+    echo "SUCCESS: Hybrid BIOS/UEFI disk image $OUTPUT_IMG created!"
+
+elif [ "$FORMAT" = "iso" ]; then
+    # ISO format: Output a hybrid BIOS/UEFI ISO named kinet-version-arch.iso
+    OUTPUT_ISO="build/binary/kinet-${VERSION}-${ARCH}.iso"
+    
+    # Create a temporary hybrid image to embed inside the ISO
+    TEMP_IMG="build/temp_hybrid.img"
+    create_hybrid_img "$TEMP_IMG"
+    
+    echo "=== Packaging Bootable Hybrid ISO ==="
+    mkdir -p build/iso_root
+    
+    # The hybrid image serves as both BIOS floppy boot and UEFI boot partition
+    cp "$TEMP_IMG" build/iso_root/boot.img
+    
+    # Build the ISO using El Torito for BIOS and El Torito Alt Boot for UEFI
+    genisoimage -quiet -V "KINET_OS" -b boot.img -eltorito-alt-boot -e boot.img -no-emul-boot -o "$OUTPUT_ISO" build/iso_root/
+    
+    rm -rf build/iso_root "$TEMP_IMG"
+    echo "SUCCESS: Hybrid BIOS/UEFI ISO $OUTPUT_ISO created!"
+fi
+
+echo "========================================="
+echo " BUILD SUCCESSFUL (Format: $FORMAT, Arch: $ARCH) "
+echo "========================================="
