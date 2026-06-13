@@ -135,12 +135,25 @@ if [ "$ARCH" = "x86_64" ]; then
     mkdir -p build/uefi/driver
     mkdir -p build/uefi/userland
     
-    gcc -m64 -c -ffreestanding -fshort-wchar -mno-red-zone -DUEFI_MODE -fpic -fpie -I driver/include kernel/kernel.c -o build/uefi/kernel/kernel.o
-    gcc -m64 -c -ffreestanding -fshort-wchar -mno-red-zone -DUEFI_MODE -fpic -fpie -I driver/include driver/console.c -o build/uefi/driver/console.o
-    g++ -m64 -c -ffreestanding -fshort-wchar -mno-red-zone -DUEFI_MODE -fpic -fpie -fno-rtti -fno-exceptions -I driver/include userland/shell.cpp -o build/uefi/userland/shell.o
+    # UEFI flags:
+    #  -mabi=ms                       : UEFI firmware uses the Microsoft x64 calling
+    #                                   convention; without this, calls into protocol
+    #                                   functions (e.g. ConOut->OutputString) pass
+    #                                   arguments in the wrong registers and produce
+    #                                   no output / faults.
+    #  -fno-asynchronous-unwind-tables: drop the .eh_frame section
+    #  -fno-ident                     : drop the .comment section
+    #  -fcf-protection=none           : drop the .note.gnu.property section
+    #  (--build-id=none below drops the .note.gnu.build-id section)
+    # These junk sections are placed by the linker outside SizeOfImage, which makes
+    # the UEFI loader reject the PE with "Load Error" (the cause of ISO/UEFI not booting).
+    UEFI_CFLAGS="-ffreestanding -fshort-wchar -mno-red-zone -DUEFI_MODE -fpic -fpie -mabi=ms -fno-asynchronous-unwind-tables -fno-ident -fcf-protection=none"
+    gcc -m64 -c $UEFI_CFLAGS -I driver/include kernel/kernel.c -o build/uefi/kernel/kernel.o
+    gcc -m64 -c $UEFI_CFLAGS -I driver/include driver/console.c -o build/uefi/driver/console.o
+    g++ -m64 -c $UEFI_CFLAGS -fno-rtti -fno-exceptions -I driver/include userland/shell.cpp -o build/uefi/userland/shell.o
 
     echo "--- Linking x86_64 UEFI Application ---"
-    ld -m i386pep --subsystem 10 -e efi_main -S \
+    ld -m i386pep --subsystem 10 -e efi_main --build-id=none -S \
         build/uefi/arch/boot/x86_64/boot.o build/uefi/kernel/kernel.o build/uefi/driver/console.o build/uefi/userland/shell.o \
         -o "$UEFI_EFI"
 
@@ -182,12 +195,16 @@ elif [ "$ARCH" = "x86" ]; then
     mkdir -p build/uefi/driver
     mkdir -p build/uefi/userland
     
-    gcc -m32 -c -ffreestanding -fshort-wchar -DUEFI_MODE -fno-pic -fno-pie -I driver/include kernel/kernel.c -o build/uefi/kernel/kernel.o
-    gcc -m32 -c -ffreestanding -fshort-wchar -DUEFI_MODE -fno-pic -fno-pie -I driver/include driver/console.c -o build/uefi/driver/console.o
-    g++ -m32 -c -ffreestanding -fshort-wchar -DUEFI_MODE -fno-pic -fno-pie -fno-rtti -fno-exceptions -I driver/include userland/shell.cpp -o build/uefi/userland/shell.o
+    # 32-bit UEFI uses the standard cdecl calling convention (matches gcc's default),
+    # so no -mabi override is needed. The junk-section flags are still required so the
+    # linker does not place non-allocated sections outside SizeOfImage (UEFI "Load Error").
+    UEFI_CFLAGS="-ffreestanding -fshort-wchar -DUEFI_MODE -fno-pic -fno-pie -fno-asynchronous-unwind-tables -fno-ident -fcf-protection=none"
+    gcc -m32 -c $UEFI_CFLAGS -I driver/include kernel/kernel.c -o build/uefi/kernel/kernel.o
+    gcc -m32 -c $UEFI_CFLAGS -I driver/include driver/console.c -o build/uefi/driver/console.o
+    g++ -m32 -c $UEFI_CFLAGS -fno-rtti -fno-exceptions -I driver/include userland/shell.cpp -o build/uefi/userland/shell.o
 
     echo "--- Linking x86 UEFI Application ---"
-    ld -m i386pe --subsystem 10 -e efi_main -S \
+    ld -m i386pe --subsystem 10 -e efi_main --build-id=none -S \
         build/uefi/arch/boot/x86/boot.o build/uefi/kernel/kernel.o build/uefi/driver/console.o build/uefi/userland/shell.o \
         -o "$UEFI_EFI"
 fi
@@ -226,6 +243,54 @@ create_hybrid_img() {
 }
 
 # =====================================================================
+# Helper function to create a PARTITIONED hybrid BIOS/UEFI disk image.
+#
+# A 1.44MB "superfloppy" (FAT at sector 0, no partition table) only boots in
+# legacy BIOS mode when the firmware treats it as a floppy. Booted from USB or
+# as a hard disk, real BIOSes need a partition table (otherwise: "no such
+# partition") and a geometry-independent kernel read. This builds a real disk:
+#
+#   sector 0           : MBR (boot code + partition table)
+#   sector 1 ..        : raw BIOS kernel (loaded by the MBR via INT 13h/AH=42h)
+#   sector 2048 ..     : FAT EFI System Partition (type 0xEF) with bootx64.efi
+# =====================================================================
+create_disk_img() {
+    local target_file="$1"
+    echo "Creating partitioned BIOS/UEFI disk image: $target_file"
+
+    local part_start=2048            # 1 MiB-aligned first partition
+    local part_sectors=2880          # 1.44MB FAT EFI System Partition
+    local total_sectors=$((part_start + part_sectors))
+
+    # 1. Zeroed disk
+    dd if=/dev/zero of="$target_file" bs=512 count=$total_sectors 2>/dev/null
+
+    # 2. Partition table: one bootable EFI-type (0xEF) partition
+    printf 'label: dos\nstart=%s, size=%s, type=ef, bootable\n' "$part_start" "$part_sectors" \
+        | sfdisk --quiet "$target_file" >/dev/null 2>&1
+
+    # 3. Build the FAT EFI System Partition (reuses the proven FAT layout) and
+    #    place it at the partition offset.
+    local tmp_esp="build/disk_esp.img"
+    create_hybrid_img "$tmp_esp"
+    dd if="$tmp_esp" of="$target_file" bs=512 seek=$part_start conv=notrunc 2>/dev/null
+    rm -f "$tmp_esp"
+
+    # 4. Store the raw BIOS kernel right after the MBR (LBA 1).
+    dd if=build/bios/kernel.bin of="$target_file" bs=512 seek=1 conv=notrunc 2>/dev/null
+
+    # 5. Assemble the MBR (DISK variant) and write only its bootstrap area
+    #    (first 446 bytes), preserving the partition table sfdisk just wrote.
+    if [ "$ARCH" = "x86_64" ]; then
+        nasm -f bin -d BIOS -d DISK arch/boot/x86_64/boot.asm -o build/mbr.bin
+    else
+        nasm -f bin -d BIOS -d DISK arch/boot/x86/boot.asm -o build/mbr.bin
+    fi
+    dd if=build/mbr.bin of="$target_file" bs=1 count=446 conv=notrunc 2>/dev/null
+    rm -f build/mbr.bin
+}
+
+# =====================================================================
 # Packaging according to requested format
 # =====================================================================
 if [ "$FORMAT" = "bin" ]; then
@@ -235,29 +300,56 @@ if [ "$FORMAT" = "bin" ]; then
     echo "SUCCESS: Hybrid BIOS/UEFI binary $OUTPUT_BIN created!"
 
 elif [ "$FORMAT" = "img" ]; then
-    # IMG format: Output a hybrid BIOS/UEFI boot image named kinet-version-arch.img
+    # IMG format: Output a partitioned hybrid BIOS/UEFI disk image (USB/HDD bootable)
     OUTPUT_IMG="build/binary/kinet-${VERSION}-${ARCH}.img"
-    create_hybrid_img "$OUTPUT_IMG"
+    create_disk_img "$OUTPUT_IMG"
     echo "SUCCESS: Hybrid BIOS/UEFI disk image $OUTPUT_IMG created!"
 
 elif [ "$FORMAT" = "iso" ]; then
     # ISO format: Output a hybrid BIOS/UEFI ISO named kinet-version-arch.iso
     OUTPUT_ISO="build/binary/kinet-${VERSION}-${ARCH}.iso"
-    
-    # Create a temporary hybrid image to embed inside the ISO
-    TEMP_IMG="build/temp_hybrid.img"
-    create_hybrid_img "$TEMP_IMG"
-    
+
+    # -----------------------------------------------------------------
+    # BIOS boot image: NO-EMULATION El Torito.
+    # The legacy "1.44MB floppy emulation" mode boots under QEMU/SeaBIOS but is
+    # unreliable on real BIOSes and many VMs (the cause of "ISO won't boot in
+    # legacy mode"). No-emulation is what real distros use.
+    #
+    # In no-emulation mode the BIOS loads the whole boot image (boot sector +
+    # kernel) contiguously at 0x7C00, so we assemble a special bootloader variant
+    # (-d ISO) that relocates the already-loaded kernel instead of reading a disk.
+    # -----------------------------------------------------------------
+    if [ "$ARCH" = "x86_64" ]; then
+        ISO_BOOT_SRC="arch/boot/x86_64/boot.asm"
+    else
+        ISO_BOOT_SRC="arch/boot/x86/boot.asm"
+    fi
+    ISO_BOOT_BIN="build/iso_bios_boot.bin"
+    ISO_BIOS_IMG="build/iso_bios.bin"
+    echo "--- Assembling No-Emulation BIOS Bootloader for ISO ---"
+    nasm -f bin -d BIOS -d ISO "$ISO_BOOT_SRC" -o "$ISO_BOOT_BIN"
+    cat "$ISO_BOOT_BIN" build/bios/kernel.bin > "$ISO_BIOS_IMG"
+    # Pad to 16 sectors (8KB) so the BIOS reliably loads the boot sector plus the
+    # full 15-sector kernel span (matches -boot-load-size 16 below).
+    truncate -s 8192 "$ISO_BIOS_IMG"
+
+    # UEFI boot image: a FAT EFI System Partition carrying /efi/boot/bootx64.efi.
+    UEFI_IMG_FILE="build/iso_efi.img"
+    create_hybrid_img "$UEFI_IMG_FILE"
+
     echo "=== Packaging Bootable Hybrid ISO ==="
     mkdir -p build/iso_root
-    
-    # The hybrid image serves as both BIOS floppy boot and UEFI boot partition
-    cp "$TEMP_IMG" build/iso_root/boot.img
-    
-    # Build the ISO using El Torito for BIOS and El Torito Alt Boot for UEFI
-    genisoimage -quiet -V "KINET_OS" -b boot.img -eltorito-alt-boot -e boot.img -no-emul-boot -o "$OUTPUT_ISO" build/iso_root/
-    
-    rm -rf build/iso_root "$TEMP_IMG"
+    cp "$ISO_BIOS_IMG" build/iso_root/bios.bin
+    cp "$UEFI_IMG_FILE" build/iso_root/efi.img
+
+    # First El Torito entry  -> BIOS  (platform 0x00, no emulation)
+    # Second El Torito entry -> UEFI  (platform 0xEF, no emulation, FAT ESP)
+    genisoimage -quiet -V "KINET_OS" \
+        -b bios.bin -no-emul-boot -boot-load-size 16 \
+        -eltorito-alt-boot -e efi.img -no-emul-boot \
+        -o "$OUTPUT_ISO" build/iso_root/
+
+    rm -rf build/iso_root "$ISO_BOOT_BIN" "$ISO_BIOS_IMG" "$UEFI_IMG_FILE"
     echo "SUCCESS: Hybrid BIOS/UEFI ISO $OUTPUT_ISO created!"
 fi
 

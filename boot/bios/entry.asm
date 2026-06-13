@@ -10,8 +10,11 @@
 jmp short start
 nop
 
+%ifndef DISK
 ; =====================================================================
 ; FAT12 BIOS Parameter Block (BPB)
+; (omitted in DISK/MBR mode: there sector 0 is a Master Boot Record with a
+;  partition table, not a FAT volume boot record.)
 ; =====================================================================
 db "MSWIN4.1"          ; OEM Name (8 bytes)
 dw 512                  ; Bytes per sector
@@ -32,6 +35,7 @@ db 0x29                 ; Extended boot signature
 dd 0x12345678           ; Volume ID
 db "KINET OS   "        ; Volume label (11 bytes)
 db "FAT12   "           ; File system type (8 bytes)
+%endif
 
 ; =====================================================================
 ; Bootloader Code
@@ -50,12 +54,45 @@ start:
 
     mov [BOOT_DRIVE], dl     ; BIOS stores boot drive id in DL register
 
+%ifdef ISO
+    ; ==================== No-Emulation CD Boot (El Torito) ===============
+    ; When booted from a CD/ISO in "no emulation" mode, the BIOS loads the
+    ; whole boot image (this boot sector + the kernel that follows it) as one
+    ; contiguous blob at 0x7C00. We therefore do NOT touch the disk at all;
+    ; the kernel already sits directly after this 512-byte sector, at 0x7E00.
+    ;
+    ; Relocate it down to KERNEL_OFFSET (0x9000) where it was linked to run.
+    ; Source (0x7E00) and destination (0x9000) overlap, so copy BACKWARDS.
+    KERNEL_BYTES equ 15 * 512        ; same span the floppy path reads (7.5KB)
+    std                              ; set direction flag -> decrement
+    mov si, 0x7E00 + KERNEL_BYTES - 1
+    mov di, KERNEL_OFFSET + KERNEL_BYTES - 1
+    mov cx, KERNEL_BYTES
+    rep movsb
+    cld                              ; restore forward direction
+%elifdef DISK
+    ; ==================== Partitioned Disk Boot (MBR / USB / HDD) =========
+    ; This image is a real partitioned disk: sector 0 is the MBR, the kernel is
+    ; stored raw in the reserved gap right after it (starting at LBA 1), and the
+    ; UEFI FAT partition lives further in. BIOS hands us the disk drive in DL.
+    ;
+    ; Read the kernel with INT 13h extended read (AH=42h, LBA addressing) so it
+    ; works regardless of the BIOS-assigned disk geometry -- the floppy-style CHS
+    ; conversion does NOT work on hard-disk/USB drives.
+    mov dl, [BOOT_DRIVE]
+    mov si, disk_address_packet
+    mov ah, 0x42
+    int 0x13
+    jc disk_error
+%else
+    ; ==================== Floppy / Raw Disk Boot =========================
     ; Load the kernel starting from LBA 33 (first cluster of data region in FAT12)
     ; We read 15 sectors (7.5KB) which is plenty for our small kernel
     mov ax, 33               ; AX = Starting LBA (Sector 33)
     mov cx, 15               ; CX = Number of sectors to read
     mov bx, KERNEL_OFFSET    ; ES:BX = Destination address
     call load_kernel_lba
+%endif
 
     ; Transition to protected/long mode according to the target architecture
     cli
@@ -122,9 +159,26 @@ start:
     jmp CODE32_SEG:init_32bit
 %endif
 
+%ifdef DISK
+; =====================================================================
+; Disk Address Packet for INT 13h AH=42h (LBA extended read).
+; Reads the raw kernel image (15 sectors) from LBA 1 into 0000:KERNEL_OFFSET.
+; =====================================================================
+disk_address_packet:
+    db 0x10                  ; Packet size (16 bytes)
+    db 0                     ; Reserved
+    dw 15                    ; Number of sectors to read
+    dw KERNEL_OFFSET         ; Destination offset
+    dw 0                     ; Destination segment
+    dq 1                     ; Starting LBA (sector 1, right after the MBR)
+%endif
+
 ; =====================================================================
 ; Load sectors from disk using LBA addressing (CHS conversion loop)
+; Only used by the floppy boot path.
 ; =====================================================================
+%ifndef ISO
+%ifndef DISK
 load_kernel_lba:
 .read_sector:
     push ax
@@ -161,6 +215,8 @@ load_kernel_lba:
     add bx, 512              ; Increment memory offset
     loop .read_sector
     ret
+%endif
+%endif
 
 disk_error:
     jmp $                    ; Halt on disk read error
