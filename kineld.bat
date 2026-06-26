@@ -204,7 +204,7 @@ if "%ARCH%"=="x86_64" (
 
     echo --- Linking x86_64 BIOS Kernel ---
     REM Link kernel.o first to ensure it occupies the entry address (0x9000). Set image-base to 0 to avoid relocation truncation.
-    ld -m i386pep --image-base 0x0 -Ttext 0x9000 -e kernel_main build/bios/kernel/kernel.o build/bios/driver/console.o build/bios/userland/shell.o -o build/bios/kernel.elf
+    ld -m i386pep --image-base 0x0 --file-alignment 16 --section-alignment 16 -Ttext 0x9000 -e kernel_main build/bios/kernel/kernel.o build/bios/driver/console.o build/bios/userland/shell.o -o build/bios/kernel.elf
     objcopy -O binary build/bios/kernel.elf build/bios/kernel.bin
     del /f /q build\bios\kernel.elf
 
@@ -255,7 +255,7 @@ if "%ARCH%"=="x86_64" (
 
     echo --- Linking x86 BIOS Kernel ---
     REM Link kernel.o first to ensure it occupies the entry address (0x9000). Set image-base to 0 to avoid relocation truncation.
-    ld -m i386pe --image-base 0x0 -Ttext 0x9000 -e kernel_main build/bios/kernel/kernel.o build/bios/driver/console.o build/bios/userland/shell.o -o build/bios/kernel.elf
+    ld -m i386pe --image-base 0x0 --file-alignment 16 --section-alignment 16 -Ttext 0x9000 -e kernel_main build/bios/kernel/kernel.o build/bios/driver/console.o build/bios/userland/shell.o -o build/bios/kernel.elf
     objcopy -O binary build/bios/kernel.elf build/bios/kernel.bin
     del /f /q build\bios\kernel.elf
 
