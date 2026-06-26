@@ -40,6 +40,33 @@ if [ "$1" = "sync" ] && [ "$2" = "tools" ]; then
     exit 0
 fi
 
+# Check for toolsync status command
+if [ "$1" = "toolsync" ] && [ "$2" = "status" ]; then
+    echo "=== Toolchain Status ==="
+    tools=("nasm" "gcc" "g++" "ld" "mformat" "mcopy" "mmd" "sfdisk" "genisoimage" "dd")
+    for tool in "${tools[@]}"; do
+        if [ "$tool" = "genisoimage" ]; then
+            if command -v xorrisofs >/dev/null 2>&1; then
+                echo "  [OK] xorrisofs (alternative to genisoimage) : Installed ($(command -v xorrisofs))"
+            elif command -v genisoimage >/dev/null 2>&1; then
+                echo "  [OK] genisoimage : Installed ($(command -v genisoimage))"
+            elif command -v mkisofs >/dev/null 2>&1; then
+                echo "  [OK] mkisofs (alternative to genisoimage) : Installed ($(command -v mkisofs))"
+            else
+                echo "  [MISSING] genisoimage / mkisofs / xorrisofs"
+            fi
+            continue
+        fi
+
+        if command -v "$tool" >/dev/null 2>&1; then
+            echo "  [OK] $tool : Installed ($(command -v "$tool"))"
+        else
+            echo "  [MISSING] $tool"
+        fi
+    done
+    exit 0
+fi
+
 # Parse arguments
 for arg in "$@"; do
     case $arg in
@@ -66,6 +93,7 @@ for arg in "$@"; do
             echo "Usage:"
             echo "  kineld [clean] [build] [-iso | -img] [--x86 | --x86_64]"
             echo "  kineld sync tools"
+            echo "  kineld toolsync status"
             exit 1
             ;;
     esac
@@ -344,10 +372,16 @@ elif [ "$FORMAT" = "iso" ]; then
 
     # First El Torito entry  -> BIOS  (platform 0x00, no emulation)
     # Second El Torito entry -> UEFI  (platform 0xEF, no emulation, FAT ESP)
-    genisoimage -quiet -V "KINET_OS" \
-        -b bios.bin -no-emul-boot -boot-load-size 16 \
-        -eltorito-alt-boot -e efi.img -no-emul-boot \
-        -o "$OUTPUT_ISO" build/iso_root/
+    if command -v xorrisofs >/dev/null 2>&1; then
+        xorrisofs -quiet -V "KINET_OS" -b bios.bin -no-emul-boot -boot-load-size 16 -eltorito-alt-boot -e efi.img -no-emul-boot -o "$OUTPUT_ISO" build/iso_root/
+    elif command -v mkisofs >/dev/null 2>&1; then
+        mkisofs -quiet -V "KINET_OS" -b bios.bin -no-emul-boot -boot-load-size 16 -eltorito-alt-boot -e efi.img -no-emul-boot -o "$OUTPUT_ISO" build/iso_root/
+    elif command -v genisoimage >/dev/null 2>&1; then
+        genisoimage -quiet -V "KINET_OS" -b bios.bin -no-emul-boot -boot-load-size 16 -eltorito-alt-boot -e efi.img -no-emul-boot -o "$OUTPUT_ISO" build/iso_root/
+    else
+        echo "Error: xorrisofs, mkisofs, or genisoimage not found."
+        exit 1
+    fi
 
     rm -rf build/iso_root "$ISO_BOOT_BIN" "$ISO_BIOS_IMG" "$UEFI_IMG_FILE"
     echo "SUCCESS: Hybrid BIOS/UEFI ISO $OUTPUT_ISO created!"
